@@ -336,21 +336,56 @@ def _add_repr(cl, ns=None, attrs=None):
     return cl
 
 
+def categorise_auto_attrs(all_attrs):
+    attrs = []
+    default_attrs = []
+    for attr in all_attrs:
+        if attr.default is NOTHING:
+            attrs.append(attr)
+        else:
+            default_attrs.append(attr)
+    return attrs, default_attrs
+
+
+def deconstruct_user_defined_init(klass):
+    if '__init__' in klass.__dict__ and inspect.isfunction(klass.__init__):
+        user_init = klass.__init__
+        # chop off the def __init__ line
+        code_lines = [
+            line.lstrip(" ") for line in
+            inspect.getsource(user_init).split('\n')[1:]]
+        user_attrs = []
+        user_default_attrs = []
+        for name, attr in inspect.signature(user_init).parameters.items():
+            if name != 'self':
+                if attr.default == inspect.Parameter.empty:
+                    user_attrs.append(attr)
+                else:
+                    user_default_attrs.append(attr)
+    else:
+        # likely a wrapper_descriptor, i.e no user defined init.
+        user_attrs = user_default_attrs = code_lines = []
+    return user_attrs, user_default_attrs, code_lines
+
+
 def _add_init(cl):
-    attrs = [a for a in cl.__attrs_attrs__
-             if a.init or a.default is not NOTHING]
+    attr_attrs = [
+        a for a in cl.__attrs_attrs__ if a.init or a.default is not NOTHING]
+    attrs, default_attrs = categorise_auto_attrs(attr_attrs)
+    user_attrs, user_default_attrs, user_init_code = (
+        deconstruct_user_defined_init(cl))
+    all_attrs = attrs + user_attrs + default_attrs + user_default_attrs
 
     # We cache the generated init methods for the same kinds of attributes.
     sha1 = hashlib.sha1()
-    sha1.update(repr(attrs).encode("utf-8"))
+    sha1.update(repr(all_attrs).encode("utf-8"))
     unique_filename = "<attrs generated init {0}>".format(
         sha1.hexdigest()
     )
-
-    script = _attrs_to_script(attrs)
+    script = _attrs_to_script(all_attrs, user_init_code)
     locs = {}
     bytecode = compile(script, unique_filename, "exec")
-    attr_dict = dict((a.name, a) for a in attrs)
+    attr_dict = dict((a.name, a) for a in all_attrs)
     exec_(bytecode, {"NOTHING": NOTHING,
                      "attr_dict": attr_dict,
                      "validate": validate,
@@ -420,7 +455,7 @@ def _convert(inst):
             setattr(inst, a.name, a.convert(getattr(inst, a.name)))
 
 
-def _attrs_to_script(attrs):
+def _attrs_to_script(attrs, user_init_code=None):
     """
     Return a valid Python script of an initializer for *attrs*.
     """
@@ -429,6 +464,14 @@ def _attrs_to_script(attrs):
     has_validator = False
     has_convert = False
     for a in attrs:
+        if isinstance(a, inspect.Parameter):
+            if a.default == inspect.Parameter.empty:
+                args.append(a.name)
+            else:
+                args.append(
+                    "{attr_name}=attr_dict['{attr_name}'].default".format(
+                        attr_name=a.name))
+            continue
         if a.validator is not None:
             has_validator = True
         if a.convert is not None:
@@ -479,13 +522,16 @@ else:
     if has_validator:
         lines.append("validate(self)")
 
-    return """\
-def __init__(self, {args}):
-    {setters}
-""".format(
-        args=", ".join(args),
-        setters="\n    ".join(lines) if lines else "pass",
-    )
+    script = "def __init__(self, {args}):\n".format(args=", ".join(args))
+    if lines:
+        script += "    {}\n".format("\n    ".join(lines))
+    if user_init_code:
+        print(user_init_code)
+        script += "    {}\n".format("\n    ".join(user_init_code))
+    if not lines and not user_init_code:
+        script += "\n    pass"
+    print(script)
+    return script
 
 
 class Attribute(object):
